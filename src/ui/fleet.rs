@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use std::time::Instant;
 
 use crate::app::App;
@@ -103,6 +103,12 @@ fn draw_daily_usage(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Hand-rendered daily-usage tape. Every slot of the window is visibly
+/// accounted for — a bar (observed), a low mark (measured zero), or a faint
+/// baseline dot (unobserved) — because ratatui's `BarChart` draws nothing at
+/// all for zero-height bars, which made absent days look broken instead of
+/// quiet. Date ticks sit at a fixed 5-day interval, anchored on today, using
+/// the same relative vocabulary as the rolling charts' x-axis.
 fn draw_usage_chart(
     frame: &mut Frame,
     app: &App,
@@ -112,26 +118,41 @@ fn draw_usage_chart(
     days: &[DayUsage],
 ) {
     let t = &app.theme;
-    let inner_w = area.width.saturating_sub(2) as usize; // block borders
+    let ascii = t.mode == crate::ui::theme::ColorMode::Mono;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    if inner_w == 0 || inner_h < 2 {
+        return;
+    }
+    // Last inner row is the date-tick axis; the rest is bar area.
+    let chart_rows = inner_h - 1;
 
     // Bars size dynamically with the terminal: wide terminals get wider
     // bars with gaps; narrow ones pack width-1 bars and, when even those
-    // cannot fit, show only the most recent days (labelled below).
+    // cannot fit, show only the most recent days (labelled in the title).
     let per = (inner_w / USAGE_WINDOW_DAYS).max(1);
-    let (bar_width, bar_gap) = if per >= 3 { (per - 1, 1) } else { (per, 0) };
-    let fit = (inner_w / (bar_width + bar_gap).max(1))
-        .clamp(1, USAGE_WINDOW_DAYS)
-        .min(days.len());
+    let (bar_w, gap) = if per >= 3 { (per - 1, 1) } else { (per, 0) };
+    let step = (bar_w + gap).max(1);
+    let fit = (inner_w / step).clamp(1, USAGE_WINDOW_DAYS).min(days.len());
     let shown = &days[days.len() - fit..];
 
     let total: Option<f64> = shown
         .iter()
         .filter_map(get)
         .fold(None, |acc: Option<f64>, v| Some(acc.unwrap_or(0.0) + v));
+    let peak = shown.iter().filter_map(get).fold(0.0_f64, f64::max);
+
     let mut title_spans = vec![Span::styled(format!(" {title} "), t.heading)];
     title_spans.push(Span::styled(format!("Σ {}", format::count(total)), t.value));
+    if peak > 0.0 {
+        // The y-scale: bars are normalized to the busiest shown day.
+        title_spans.push(Span::styled(
+            format!("  pk {}", format::count(Some(peak))),
+            t.dim,
+        ));
+    }
     if fit < USAGE_WINDOW_DAYS {
-        title_spans.push(Span::styled(format!(" (last {fit}d)"), t.dim));
+        title_spans.push(Span::styled(format!("  last {fit}d"), t.dim));
     }
     title_spans.push(Span::raw(" "));
 
@@ -139,46 +160,89 @@ fn draw_usage_chart(
         .borders(Borders::ALL)
         .border_style(t.dim)
         .title(Line::from(title_spans));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let bars: Vec<Bar> = shown
+    // Per-day column height in eighth-rows; None = unobserved.
+    let heights: Vec<Option<usize>> = shown
         .iter()
         .map(|d| {
-            let day_of_month = d.day.get(8..10).unwrap_or("");
-            let mut bar = Bar::default();
-            match get(d) {
-                Some(v) => {
-                    bar = bar.value(v.round().max(0.0) as u64).style(t.value);
-                    // Value text only when the bar is wide enough to carry it.
-                    if bar_width < 5 {
-                        bar = bar.text_value(String::new());
-                    } else {
-                        bar = bar.text_value(format::count(Some(v)));
-                    }
+            get(d).map(|v| {
+                if peak <= 0.0 || v <= 0.0 {
+                    0
+                } else {
+                    // Anything observed and non-zero shows at least ▁.
+                    (((v / peak) * (chart_rows * 8) as f64).round() as usize)
+                        .clamp(1, chart_rows * 8)
                 }
-                // Unobserved day: zero-height bar, explicitly marked, never
-                // a fabricated zero.
-                None => {
-                    bar = bar.value(0).style(t.na);
-                    bar = bar.text_value(if bar_width >= 2 {
-                        "--".into()
-                    } else {
-                        String::new()
-                    });
-                }
-            }
-            if bar_width >= 2 {
-                bar = bar.label(Line::from(Span::styled(day_of_month.to_string(), t.dim)));
-            }
-            bar
+            })
         })
         .collect();
 
-    let chart = BarChart::default()
-        .block(block)
-        .bar_width(bar_width as u16)
-        .bar_gap(bar_gap as u16)
-        .data(BarGroup::default().bars(&bars));
-    frame.render_widget(chart, area);
+    const EIGHTHS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let mut lines: Vec<Line> = Vec::with_capacity(chart_rows + 1);
+    for row in 0..chart_rows {
+        // Rows render top-down; `floor` is how many eighths sit below this row.
+        let floor = (chart_rows - 1 - row) * 8;
+        let mut spans: Vec<Span> = Vec::with_capacity(fit + 1);
+        for (i, h) in heights.iter().enumerate() {
+            let is_baseline = row == chart_rows - 1;
+            let (cell, style) = match h {
+                // Unobserved day: a quiet dot on the baseline, never a bar.
+                None if is_baseline => (if ascii { "." } else { "·" }, t.na),
+                // Measured zero: an explicit low mark, distinct from absent.
+                Some(0) if is_baseline => (if ascii { "_" } else { "▁" }, t.dim),
+                Some(h) if *h > floor => {
+                    let filled = h - floor;
+                    if filled >= 8 {
+                        (if ascii { "#" } else { "█" }, t.value)
+                    } else if ascii {
+                        // No partial blocks in ASCII: round at half a row.
+                        (if filled >= 4 { "#" } else { " " }, t.value)
+                    } else {
+                        (EIGHTHS[filled - 1], t.value)
+                    }
+                }
+                _ => (" ", t.dim),
+            };
+            spans.push(Span::styled(cell.repeat(bar_w.max(1)), style));
+            if gap > 0 && i + 1 < fit {
+                spans.push(Span::raw(" ".repeat(gap)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Date ticks: every 5 days, anchored on today (rightmost slot), in the
+    // rolling charts' relative vocabulary: `-25d … -10d -5d today`.
+    // "today" is placed first and always wins; older ticks yield to it.
+    let today_text = "today";
+    let today_end = ((fit - 1) * step + bar_w).min(inner_w);
+    let today_start = today_end.saturating_sub(today_text.len());
+    let mut axis: Vec<Span> = Vec::new();
+    let mut cursor = 0usize;
+    for i in 0..fit.saturating_sub(1) {
+        let days_ago = fit - 1 - i;
+        if !days_ago.is_multiple_of(5) {
+            continue;
+        }
+        let text = format!("-{days_ago}d");
+        let start = (i * step).min(inner_w.saturating_sub(text.len()));
+        // Skip ticks that would collide with a neighbor or with "today".
+        if start < cursor || start + text.len() + 1 > today_start {
+            continue;
+        }
+        axis.push(Span::raw(" ".repeat(start - cursor)));
+        cursor = start + text.len();
+        axis.push(Span::styled(text, t.dim));
+    }
+    if today_text.len() <= inner_w && today_start >= cursor {
+        axis.push(Span::raw(" ".repeat(today_start - cursor)));
+        axis.push(Span::styled(today_text, t.secondary));
+    }
+    lines.push(Line::from(axis));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
