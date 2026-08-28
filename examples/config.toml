@@ -1,0 +1,65 @@
+# sglangtop configuration
+#
+# Default location: ~/.config/sglangtop/config.toml
+# (or $XDG_CONFIG_HOME/sglangtop/config.toml when XDG_CONFIG_HOME is set)
+# Explicit path: sglangtop --config /path/to/config.toml
+#
+# Precedence: built-in defaults < this file < command-line flags.
+# `--endpoint` on the command line REPLACES the whole [[endpoints]] list.
+#
+# SECRETS ARE NEVER STORED HERE. Fields ending in `_env` name environment
+# variables whose values are read at startup. If a named variable is unset,
+# only that endpoint is disabled (with a clear error); others keep working.
+
+# How often to poll each endpoint, in milliseconds (1000..=60000).
+refresh_interval_ms = 1000
+
+# How much in-memory history to keep for charts, in seconds (30..=86400).
+history_seconds = 300
+
+# Rolling window for latency percentile estimates, in seconds (5..=3600).
+percentile_window_seconds = 60
+
+# Days of history kept in the SQLite database.
+retention_days = 30
+
+# Recording is ON by default at $XDG_DATA_HOME/sglangtop/usage.db (fallback
+# ~/.local/share/sglangtop/usage.db); it feeds the fleet daily-usage charts.
+# Uncomment to change the location or turn it off entirely:
+# record_path = "/var/lib/sglangtop/usage.db"
+# no_record = true
+
+# --- Endpoints ------------------------------------------------------------
+# With no [[endpoints]] and no --endpoint flags, sglangtop monitors
+# http://127.0.0.1:30000 (SGLang's default port) under the name "local".
+#
+# Full metrics require the server to run with --enable-metrics. Without it,
+# sglangtop automatically falls back to the always-on /v1/loads gauges
+# (running/waiting, token usage, cache hit rate, spec stats) and marks the
+# endpoint LOADS; token rates, percentiles, and daily usage need /metrics.
+
+[[endpoints]]
+name = "local"
+url = "http://127.0.0.1:30000"
+# Reserved for a future scheduler-activity ticker: SGLang's per-request log
+# grammar is not parsed yet, so setting this only shows guidance in the pane.
+# log_file = "/var/log/sglang/server.log"
+
+[[endpoints]]
+name = "spark-a"
+url = "http://10.0.0.21:30000"
+# Sends "Authorization: Bearer <value of $SPARK_A_SGLANG_TOKEN>".
+bearer_token_env = "SPARK_A_SGLANG_TOKEN"
+# Override for the running-requests capacity bar. Normally UNNECESSARY:
+# sglangtop reads the server's --max-running-requests from /server_info
+# automatically; set this only to display a different cap.
+# (CLI equivalent: an @CAP suffix, e.g. `-e spark-a=https://10.0.0.21:8443@8`.)
+# max_running = 48
+
+# Extra headers, values also resolved from the environment.
+[endpoints.header_env]
+"X-Custom-Auth" = "SPARK_A_CUSTOM_AUTH"
+
+[[endpoints]]
+# name is optional: this endpoint displays as "10.0.0.22:8443".
+url = "https://10.0.0.22:8443"

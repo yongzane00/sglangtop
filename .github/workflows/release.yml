@@ -1,0 +1,57 @@
+# Release workflow: on a v* tag, build static musl binaries for x86_64 and
+# aarch64 on NATIVE runners (no cross-compilation needed since GitHub's
+# arm64 runners are free for public repos) and attach
+#   sglangtop-vX.Y.Z-<target>.tar.gz  +  .sha256
+# to a GitHub release.
+#
+# The workflow is repo-agnostic (uses GITHUB_TOKEN and the repository it
+# runs in). Before announcing aarch64 support, verify a release binary on
+# real ARM64 hardware at least once.
+
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          draft: true
+
+  upload-assets:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Build and smoke-test BEFORE uploading anything.
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: smoke test
+        run: |
+          ldd target/${{ matrix.target }}/release/sglangtop 2>&1 | grep -Eq 'not a dynamic|statically linked'
+          target/${{ matrix.target }}/release/sglangtop --version
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: sglangtop
+          target: ${{ matrix.target }}
+          archive: $bin-$tag-$target
+          checksum: sha256
+          tar: unix
