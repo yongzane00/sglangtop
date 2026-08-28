@@ -64,12 +64,20 @@ that keep them from coming back. Ordered by layer, not chronology.
   the new field invisible — no error, no wrap, just gone. Measure a line's
   worst case before appending to it; if it doesn't fit, restructure (the
   pulse strip became three lines).
-- **Absent ≠ zero must survive into charts**: unobserved days render a
-  zero-height bar *styled as unavailable with a `--` text value*, not a
-  zero-height bar that looks like "no traffic".
-- **Dynamic sizing beats clever clipping**: bar width derives from the
+- **Absent ≠ zero must survive into charts**: an unobserved day renders a
+  faint baseline dot, a measured zero an explicit low mark — never the same
+  glyph, and never nothing at all. Widgets that skip zero-height bars
+  (ratatui's `BarChart`) cannot express the difference, which is why the
+  usage tape is hand-rendered.
+- **Dynamic sizing beats clever clipping**: bar geometry derives from the
   area every frame; when 30 days can't fit, show the last N and label it
-  `(last Nd)` in the title rather than cropping silently.
+  `last Nd` in the title rather than cropping silently.
+- **Tile a width, never floor-divide it**: `cell = width / count` quantizes
+  the drawing to a multiple of `count`, stranding up to `count - 1` columns.
+  Sibling panels one column apart (`Ratio(1, 3)` produces 59/60/59 routinely)
+  then render at visibly different scales — one full, one half-empty. Give
+  item `i` the range `[i·width/count, (i+1)·width/count)` so the row always
+  spans the full width and item widths differ by at most one column.
 
 ## Rendering to SVG (screenshot pipeline)
 

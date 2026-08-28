@@ -103,6 +103,49 @@ fn draw_daily_usage(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Geometry of the daily-usage tape. Split out from rendering so the tiling
+/// invariant — the tape always spans the full inner width, with `today`
+/// against the right border — is unit-testable without a terminal.
+struct TapeGeometry {
+    /// Days actually shown (the most recent ones when the panel is narrow).
+    fit: usize,
+    inner_w: usize,
+    /// Separating column between bars; only afforded when slots are wide.
+    gap: usize,
+}
+
+impl TapeGeometry {
+    fn new(inner_w: usize, day_count: usize) -> Self {
+        let fit = USAGE_WINDOW_DAYS.min(day_count).min(inner_w).max(1);
+        TapeGeometry {
+            fit,
+            inner_w,
+            gap: usize::from(inner_w / fit >= 3),
+        }
+    }
+
+    /// Half-open column range owned by day `i`. Consecutive slots tile
+    /// `0..inner_w` exactly; widths differ by at most one column.
+    fn slot(&self, i: usize) -> (usize, usize) {
+        (
+            i * self.inner_w / self.fit,
+            (i + 1) * self.inner_w / self.fit,
+        )
+    }
+
+    /// Drawn bar width for day `i` (at least one column).
+    fn bar_w(&self, i: usize) -> usize {
+        let (start, end) = self.slot(i);
+        (end - start).saturating_sub(self.gap).max(1)
+    }
+
+    /// Column just past the last bar — where `today` is anchored.
+    fn tape_end(&self) -> usize {
+        let (start, _) = self.slot(self.fit - 1);
+        (start + self.bar_w(self.fit - 1)).min(self.inner_w)
+    }
+}
+
 /// Hand-rendered daily-usage tape. Every slot of the window is visibly
 /// accounted for — a bar (observed), a low mark (measured zero), or a faint
 /// baseline dot (unobserved) — because ratatui's `BarChart` draws nothing at
@@ -127,13 +170,17 @@ fn draw_usage_chart(
     // Last inner row is the date-tick axis; the rest is bar area.
     let chart_rows = inner_h - 1;
 
-    // Bars size dynamically with the terminal: wide terminals get wider
-    // bars with gaps; narrow ones pack width-1 bars and, when even those
-    // cannot fit, show only the most recent days (labelled in the title).
-    let per = (inner_w / USAGE_WINDOW_DAYS).max(1);
-    let (bar_w, gap) = if per >= 3 { (per - 1, 1) } else { (per, 0) };
-    let step = (bar_w + gap).max(1);
-    let fit = (inner_w / step).clamp(1, USAGE_WINDOW_DAYS).min(days.len());
+    // Days tile the full inner width: day `i` owns columns
+    // `[i*inner_w/fit, (i+1)*inner_w/fit)`, so the tape always reaches the
+    // right border and `today` sits against it. Sizing bars by a floor
+    // division instead (`inner_w / 30`) quantized the tape to a multiple of
+    // 30 columns, so a 59-column panel drew a 30-column tape and left half
+    // its box empty while a 60-column sibling filled it — side by side they
+    // read as different charts. Slot widths now differ by at most one
+    // column. When even one column per day cannot fit, show only the most
+    // recent days (labelled in the title).
+    let geo = TapeGeometry::new(inner_w, days.len());
+    let fit = geo.fit;
     let shown = &days[days.len() - fit..];
 
     let total: Option<f64> = shown
@@ -205,9 +252,12 @@ fn draw_usage_chart(
                 }
                 _ => (" ", t.dim),
             };
-            spans.push(Span::styled(cell.repeat(bar_w.max(1)), style));
-            if gap > 0 && i + 1 < fit {
-                spans.push(Span::raw(" ".repeat(gap)));
+            let (start, end) = geo.slot(i);
+            let bar_w = geo.bar_w(i);
+            spans.push(Span::styled(cell.repeat(bar_w), style));
+            let pad = (end - start) - bar_w;
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
             }
         }
         lines.push(Line::from(spans));
@@ -217,7 +267,7 @@ fn draw_usage_chart(
     // rolling charts' relative vocabulary: `-25d … -10d -5d today`.
     // "today" is placed first and always wins; older ticks yield to it.
     let today_text = "today";
-    let today_end = ((fit - 1) * step + bar_w).min(inner_w);
+    let today_end = geo.tape_end();
     let today_start = today_end.saturating_sub(today_text.len());
     let mut axis: Vec<Span> = Vec::new();
     let mut cursor = 0usize;
@@ -227,7 +277,7 @@ fn draw_usage_chart(
             continue;
         }
         let text = format!("-{days_ago}d");
-        let start = (i * step).min(inner_w.saturating_sub(text.len()));
+        let start = geo.slot(i).0.min(inner_w.saturating_sub(text.len()));
         // Skip ticks that would collide with a neighbor or with "today".
         if start < cursor || start + text.len() + 1 > today_start {
             continue;
@@ -385,4 +435,70 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     ];
     let table = Table::new(rows, widths).header(header).column_spacing(1);
     frame.render_widget(table, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tape must span the whole panel at every width. A floor-division
+    /// bar size used to quantize it to multiples of 30 columns, so sibling
+    /// panels one column apart (59 vs 60, which `Ratio(1, 3)` produces
+    /// routinely) drew a half-empty box next to a full one.
+    #[test]
+    fn tape_fills_the_panel_at_every_width() {
+        for inner_w in 1..400usize {
+            let geo = TapeGeometry::new(inner_w, USAGE_WINDOW_DAYS);
+            // Slots tile [0, inner_w) exactly, with no gaps or overlaps.
+            assert_eq!(geo.slot(0).0, 0, "inner_w={inner_w}");
+            assert_eq!(geo.slot(geo.fit - 1).1, inner_w, "inner_w={inner_w}");
+            for i in 1..geo.fit {
+                assert_eq!(geo.slot(i - 1).1, geo.slot(i).0, "inner_w={inner_w}");
+            }
+            // Every day gets at least one drawn column...
+            for i in 0..geo.fit {
+                let (start, end) = geo.slot(i);
+                assert!(end > start, "inner_w={inner_w} day={i}");
+                assert!(geo.bar_w(i) >= 1, "inner_w={inner_w} day={i}");
+                assert!(geo.bar_w(i) <= end - start, "inner_w={inner_w} day={i}");
+            }
+            // ...and widths stay even: at most one column apart.
+            let widths: Vec<usize> = (0..geo.fit)
+                .map(|i| geo.slot(i).1 - geo.slot(i).0)
+                .collect();
+            let (lo, hi) = (*widths.iter().min().unwrap(), *widths.iter().max().unwrap());
+            assert!(hi - lo <= 1, "inner_w={inner_w} widths {lo}..{hi}");
+            // `today` is anchored against the right border (modulo the gap).
+            assert!(geo.tape_end() <= inner_w, "inner_w={inner_w}");
+            assert!(
+                inner_w - geo.tape_end() <= geo.gap,
+                "inner_w={inner_w} leaves {} columns blank",
+                inner_w - geo.tape_end()
+            );
+        }
+    }
+
+    /// The specific regression: two panels differing by one column must look
+    /// like the same chart, not one full and one half-empty.
+    #[test]
+    fn sibling_panels_one_column_apart_agree() {
+        let a = TapeGeometry::new(59, USAGE_WINDOW_DAYS);
+        let b = TapeGeometry::new(60, USAGE_WINDOW_DAYS);
+        assert_eq!(a.fit, USAGE_WINDOW_DAYS);
+        assert_eq!(b.fit, USAGE_WINDOW_DAYS);
+        assert_eq!(a.tape_end(), 59);
+        assert_eq!(b.tape_end(), 60);
+    }
+
+    /// Panels too narrow for the whole window drop older days rather than
+    /// squeezing sub-column bars; the title says so via `fit`.
+    #[test]
+    fn narrow_panels_show_fewer_days() {
+        let geo = TapeGeometry::new(12, USAGE_WINDOW_DAYS);
+        assert_eq!(geo.fit, 12);
+        assert_eq!(geo.tape_end(), 12);
+        let geo = TapeGeometry::new(1, USAGE_WINDOW_DAYS);
+        assert_eq!(geo.fit, 1);
+        assert_eq!(geo.bar_w(0), 1);
+    }
 }

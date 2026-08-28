@@ -110,12 +110,23 @@ startup failure) instead of empty axes.
 
 ## Rendering rules (`draw_daily_usage`)
 
-- Bars size dynamically: `bar_width = max(1, inner_width/30 − gap)`, gap 1
-  only when ≥ 3 cells per day. If even width-1 bars don't fit 30 days, the
-  most recent N days render and the title says `(last Nd)` — never a
-  silently cropped axis.
-- Unobserved days draw a zero-height bar styled as unavailable with a `--`
-  text value; per-bar value labels appear only at `bar_width ≥ 5`,
-  day-of-month labels at `≥ 2`.
-- Titles carry the window total (`Σ 8.85M`) computed only from observed
-  days.
+- The tape is hand-rendered rather than drawn with ratatui's `BarChart`,
+  which paints nothing at all for a zero-height bar and so made absent days
+  look broken instead of quiet.
+- Days **tile** the inner width: day `i` owns columns
+  `[i·w/fit, (i+1)·w/fit)`, so the tape always reaches the right border and
+  `today` sits against it. Slot widths differ by at most one column; a
+  1-column gap is spared only at ≥ 3 cells per day. (Sizing bars by
+  `inner_width/30` instead quantized the tape to multiples of 30 columns, so
+  a 59-column panel drew a 30-column tape beside a 60-column sibling that
+  filled its box — see `TapeGeometry` and its tests.)
+- Below one column per day, the most recent N days render and the title says
+  `last Nd` — never a silently cropped axis.
+- Every slot is visibly accounted for: a faint baseline dot (`·`) for an
+  unobserved day, an explicit low mark (`▁`) for a measured zero, and
+  eighth-block bars scaled to the shown peak (minimum `▁`) otherwise.
+- Date ticks sit every 5 days, anchored on today, in the rolling charts'
+  relative vocabulary (`-25d … -5d today`); ticks that would collide with a
+  neighbour or with `today` are dropped rather than overprinted.
+- Titles carry the window total (`Σ 8.85M`) and the peak day (`pk 487.0k`),
+  both computed only from observed days.
