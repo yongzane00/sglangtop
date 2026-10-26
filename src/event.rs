@@ -17,7 +17,7 @@ pub enum AppEvent {
         endpoint: usize,
         healthy: Option<bool>,
         server_info: Option<ServerInfo>,
-        models: Option<Vec<String>>,
+        models: Option<Vec<crate::state::ServedModel>>,
     },
     /// A collector finished one poll cycle (success or failure).
     Scrape {

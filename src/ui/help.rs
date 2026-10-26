@@ -10,6 +10,7 @@ use crate::app::App;
 const BINDINGS: &[(&str, &str)] = &[
     ("q / Ctrl+C", "quit"),
     ("Tab / Shift+Tab", "next / previous view"),
+    ("← / →", "previous / next view"),
     ("1", "fleet overview (endpoints + history charts)"),
     ("2..9", "endpoint tabs (Tab reaches the rest)"),
     ("j/k or ↑/↓", "select endpoint row (fleet view)"),
@@ -17,7 +18,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("PgUp/PgDn / wheel", "scroll the history charts"),
     ("g / G", "jump to top / last row"),
     ("s", "cycle fleet sort column"),
-    ("t", "endpoint view: toggle charts+requests / tables"),
+    ("t", "endpoint view: overview / requests / tables"),
     ("r", "force refresh now"),
     ("p", "pause display refresh (collection continues)"),
     ("+ / -", "faster / slower refresh interval"),

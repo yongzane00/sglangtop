@@ -180,7 +180,14 @@ async fn full_pipeline_against_mock_server() {
     assert_eq!(info.enable_metrics, Some(true));
     assert_eq!(info.pd_role(), None); // "null" string means unified
     assert_eq!(state.effective_max_running(None), Some(48));
-    assert_eq!(state.served_models, vec![MODEL]);
+    assert_eq!(
+        state
+            .served_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![MODEL]
+    );
     assert_eq!(
         state.freshness(std::time::Instant::now(), config.refresh_interval),
         Freshness::Fresh
@@ -554,7 +561,15 @@ async fn metrics_404_falls_back_to_loads_only() {
     let mut state = state_for(&config, 0);
     // Give the state a model name up front (normally arrives via the
     // optional probe) so the series key is stable from the first scrape.
-    state.apply_optional(None, None, Some(vec![MODEL.to_string()]));
+    state.apply_optional(
+        None,
+        None,
+        Some(vec![sglangtop::state::ServedModel {
+            id: MODEL.to_string(),
+            root: None,
+            max_model_len: None,
+        }]),
+    );
     state.apply(next_scrape_for(&mut rx, 0).await);
 
     assert_eq!(state.status, ConnStatus::Connected);

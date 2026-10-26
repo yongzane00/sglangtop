@@ -161,6 +161,15 @@ pub struct CuratedSeries {
     pub kv_usage_detail: BTreeMap<&'static str, f64>,
     /// `sglang:num_used_tokens`: used slots in the KV token pool.
     pub kv_used_tokens: Option<f64>,
+    /// `sglang:context_len`: the model's context window, in tokens.
+    pub context_len: Option<f64>,
+    /// GPU memory actually in use, in GB — SGLang reports these directly,
+    /// so unlike vLLM there is no need to infer bytes from token counts.
+    pub weight_memory_gb: Option<f64>,
+    pub kv_cache_memory_gb: Option<f64>,
+    pub graph_memory_gb: Option<f64>,
+    /// Free GPU memory measured at startup, not live headroom.
+    pub startup_free_memory_gb: Option<f64>,
     /// `sglang:max_total_num_tokens`: KV pool capacity in tokens. A directly
     /// labelled gauge — no join machinery needed (unlike vLLM).
     pub kv_cache_size_tokens: Option<f64>,
@@ -236,10 +245,57 @@ fn sum_map<K: Ord>(map: &BTreeMap<K, f64>) -> Option<f64> {
     }
 }
 
+/// Upper bound on distinct HTTP status classes / CPU components retained:
+/// both label sets are server-controlled.
+const MAX_INFO_KEYS: usize = 16;
+
+/// Endpoint-global facts that carry no `model_name` label, so they cannot
+/// live on a per-series entry. SGLang's frontend metrics (HTTP counters and
+/// tokenizer/detokenizer CPU) are labelled by endpoint/component only.
+///
+/// Note what is NOT here, because SGLang does not export it: there is no
+/// `process_start_time_seconds` (so no uptime), no resident-memory gauge and
+/// no file-descriptor gauges. GPU memory and capacity DO exist, but they are
+/// labelled per model, so they live on [`CuratedSeries`] instead.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EndpointInfo {
+    /// Status class (`2xx`/`4xx`/`5xx`) → cumulative responses, summed over
+    /// endpoints and methods. SGLang reports exact codes; we bucket them.
+    pub http_by_status: BTreeMap<String, f64>,
+    /// In-flight HTTP requests across all routes.
+    pub http_active: Option<f64>,
+    /// Cumulative CPU seconds per frontend component (`tokenizer`,
+    /// `detokenizer`). These are the frontend processes, never the scheduler
+    /// or the GPU worker.
+    pub cpu_by_component: BTreeMap<String, f64>,
+}
+
+impl EndpointInfo {
+    /// Total HTTP responses served across all status classes.
+    pub fn http_total(&self) -> Option<f64> {
+        if self.http_by_status.is_empty() {
+            None
+        } else {
+            Some(self.http_by_status.values().sum())
+        }
+    }
+
+    /// Cumulative CPU seconds across frontend components.
+    pub fn cpu_total(&self) -> Option<f64> {
+        if self.cpu_by_component.is_empty() {
+            None
+        } else {
+            Some(self.cpu_by_component.values().sum())
+        }
+    }
+}
+
 /// The curated view of one whole scrape.
 #[derive(Debug, Clone, Default)]
 pub struct CuratedScrape {
     pub series: BTreeMap<SeriesKey, CuratedSeries>,
+    /// Facts about the endpoint as a whole, not any one model series.
+    pub info: EndpointInfo,
     /// Canonical ids of curated metrics that were actually found — the
     /// endpoint's detected capabilities.
     pub capabilities: Vec<&'static str>,
@@ -344,6 +400,89 @@ pub fn curate(scrape: &ScrapeText) -> CuratedScrape {
                 intensive_gauge(family, &mut out, "kv_used", |s, v| {
                     s.kv_used_tokens = Some(v)
                 });
+            }
+            "sglang:context_len" => {
+                intensive_gauge(family, &mut out, "context_len", |s, v| {
+                    s.context_len = Some(v)
+                });
+            }
+            // GPU memory, in GB, straight from the server.
+            "sglang:weight_memory_usage_gb" => {
+                intensive_gauge(family, &mut out, "gpu_memory", |s, v| {
+                    s.weight_memory_gb = Some(v)
+                });
+            }
+            "sglang:kv_cache_memory_usage_gb" => {
+                intensive_gauge(family, &mut out, "gpu_memory", |s, v| {
+                    s.kv_cache_memory_gb = Some(v)
+                });
+            }
+            "sglang:graph_memory_usage_gb" => {
+                intensive_gauge(family, &mut out, "gpu_memory", |s, v| {
+                    s.graph_memory_gb = Some(v)
+                });
+            }
+            "sglang:startup_available_gpu_memory_gb" => {
+                intensive_gauge(family, &mut out, "gpu_memory", |s, v| {
+                    s.startup_free_memory_gb = Some(v)
+                });
+            }
+            // Frontend metrics: labelled by endpoint/component, never by
+            // model, so they land on the endpoint-global info instead.
+            "sglang:http_responses_total" => {
+                for sample in &family.samples {
+                    let Some(code) = sample.labels.get("status_code") else {
+                        continue;
+                    };
+                    if !sample.value.is_finite() {
+                        continue;
+                    }
+                    // Bucket exact codes into classes: an endpoint-wide tally
+                    // of every distinct code would be unbounded.
+                    let class = match code.chars().next() {
+                        Some(d @ '1'..='5') => format!("{d}xx"),
+                        _ => "other".to_string(),
+                    };
+                    if !out.info.http_by_status.contains_key(&class)
+                        && out.info.http_by_status.len() >= MAX_INFO_KEYS
+                    {
+                        continue;
+                    }
+                    *out.info.http_by_status.entry(class).or_insert(0.0) += sample.value;
+                }
+                if !out.info.http_by_status.is_empty() {
+                    push_capability(&mut out.capabilities, "http_responses");
+                }
+            }
+            "sglang:http_requests_active" => {
+                let total: f64 = family
+                    .samples
+                    .iter()
+                    .map(|s| s.value)
+                    .filter(|v| v.is_finite())
+                    .sum();
+                out.info.http_active = Some(total);
+                push_capability(&mut out.capabilities, "http_active");
+            }
+            "sglang:process_cpu_seconds_total" => {
+                for sample in &family.samples {
+                    let Some(component) = sample.labels.get("component") else {
+                        continue;
+                    };
+                    if !sample.value.is_finite() {
+                        continue;
+                    }
+                    let key = component.to_string();
+                    if !out.info.cpu_by_component.contains_key(&key)
+                        && out.info.cpu_by_component.len() >= MAX_INFO_KEYS
+                    {
+                        continue;
+                    }
+                    out.info.cpu_by_component.insert(key, sample.value);
+                }
+                if !out.info.cpu_by_component.is_empty() {
+                    push_capability(&mut out.capabilities, "process_cpu");
+                }
             }
             "sglang:max_total_num_tokens" => {
                 intensive_gauge(family, &mut out, "kv_capacity", |s, v| {

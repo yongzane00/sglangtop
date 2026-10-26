@@ -97,6 +97,42 @@ pub fn brief_duration(d: Duration) -> String {
     }
 }
 
+/// Coarse duration for "running since" readouts: `6h 47m`, `3d 04h`.
+/// Deliberately coarser than [`brief_duration`] — nobody reads an uptime to
+/// the second.
+pub fn uptime(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {:02}h", secs / 86_400, (secs % 86_400) / 3600)
+    }
+}
+
+/// Byte sizes in binary units (`2.53 GB`), `--` when unavailable.
+pub fn bytes(v: Option<f64>) -> String {
+    match v {
+        None => NA.into(),
+        Some(v) if !v.is_finite() => raw_value(v),
+        Some(v) => {
+            let a = v.abs();
+            if a >= 1024.0 * 1024.0 * 1024.0 {
+                format!("{:.2} GB", v / (1024.0 * 1024.0 * 1024.0))
+            } else if a >= 1024.0 * 1024.0 {
+                format!("{:.1} MB", v / (1024.0 * 1024.0))
+            } else if a >= 1024.0 {
+                format!("{:.0} KB", v / 1024.0)
+            } else {
+                format!("{v:.0} B")
+            }
+        }
+    }
+}
+
 /// Raw metric value for the Raw Metrics view: preserves NaN/±Inf spellings
 /// and full precision for normal numbers.
 pub fn raw_value(v: f64) -> String {
@@ -280,5 +316,21 @@ mod tests {
         assert_eq!(ago(Some(now), now), "now");
         let earlier = now - Duration::from_secs(83);
         assert_eq!(ago(Some(earlier), now), "1m23s ago");
+    }
+
+    #[test]
+    fn uptime_is_coarse_and_readable() {
+        assert_eq!(uptime(Duration::from_secs(45)), "45s");
+        assert_eq!(uptime(Duration::from_secs(600)), "10m");
+        assert_eq!(uptime(Duration::from_secs(24_460)), "6h 47m");
+        assert_eq!(uptime(Duration::from_secs(3 * 86_400 + 4 * 3600)), "3d 04h");
+    }
+
+    #[test]
+    fn bytes_uses_binary_units_and_dashes_when_absent() {
+        assert_eq!(bytes(None), NA);
+        assert_eq!(bytes(Some(512.0)), "512 B");
+        assert_eq!(bytes(Some(2.53474816e9)), "2.36 GB");
+        assert_eq!(bytes(Some(f64::NAN)), "NaN");
     }
 }

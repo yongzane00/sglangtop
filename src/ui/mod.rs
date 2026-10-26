@@ -1,11 +1,16 @@
 //! Rendering. Pure functions from `&App` to the frame — no state mutation.
 
+pub mod cards;
 pub mod charts;
 pub mod endpoint;
 pub mod fleet;
 pub mod format;
 pub mod help;
+pub mod panels;
 pub mod theme;
+
+#[cfg(test)]
+mod tests;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -107,16 +112,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ],
         View::Endpoint(_) => vec![
             ("q", "quit"),
-            ("Tab", "views"),
+            ("Tab/←→", "views"),
             ("1", "fleet"),
-            (
-                "t",
-                if app.endpoint_tables {
-                    "charts"
-                } else {
-                    "tables"
-                },
-            ),
+            // Advertise what pressing `t` gives you next, not where you are.
+            ("t", app.panel_mode.next_label()),
             ("r", "refresh"),
             ("p", "pause"),
             ("+/-", "interval"),

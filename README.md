@@ -1,37 +1,46 @@
 # sglangtop
 
-A colorful, DGXTOP-style terminal dashboard for monitoring
-[SGLang](https://docs.sglang.io/) servers — models, request activity,
-throughput, latency percentiles, KV token usage, cache hit rate, and
-speculative-decoding stats — for one local instance or a whole fleet, from a
-single static binary.
+![CI](https://github.com/yongzane00/sglangtop/actions/workflows/ci.yml/badge.svg)
+[![License: MIT or Apache-2.0](https://img.shields.io/badge/License-MIT%20or%20Apache--2.0-blue.svg)](https://github.com/yongzane00/sglangtop)
+
+`sglangtop` is a colorful terminal dashboard for
+[SGLang](https://docs.sglang.io/) servers, in the spirit of `htop`. Point it
+at one local instance or a whole fleet and it shows what matters: models,
+request activity, throughput, latency percentiles, KV-cache usage, cache hit
+rate, and speculative-decoding stats. One static binary, no Prometheus, no
+Grafana, no sidecar.
 
 ```
 sglangtop            # monitors http://127.0.0.1:30000
 ```
 
-**Fleet overview** — endpoint table, past-30-days usage, rolling history:
+**Fleet view** — every endpoint on one screen: live load, daily usage over
+the past 30 days, rolling history. Move with `j`/`k`, open an endpoint with
+`Enter`.
 
 ![Fleet view](docs/img/fleet.svg)
 
-**Endpoint detail** — pulse strip and token-rate charts (press `t` for
-latency-percentile tables):
+**Endpoint view** — headline stat cards over six live charts, with
+percentiles, GPU memory and an event feed below. Press `t` to cycle to the
+request log or the full percentile tables.
 
 ![Endpoint view](docs/img/endpoint.svg)
 
 *(Screenshots captured against local mock SGLang servers; the `edge`
 endpoint runs without `--enable-metrics` to show the `/v1/loads` fallback.)*
 
+I wrote sglangtop to watch my own SGLang boxes, and it grew a fleet view when
+I needed one. It is deliberately small: read-only, no server control, and
+when it does not know an answer it shows `--` instead of a fake zero.
+
 ## What it is
 
-- **Read-only, and it means it**: polls `/metrics`, plus `/ping`,
-  `/server_info`, `/v1/models`, and `/v1/loads`, with GET requests only.
-  Never proxies, inspects, or modifies inference traffic; never controls the
-  server. In particular it never calls `/health` or `/health_generate`:
-  upstream they share one handler, and with
-  `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` set `/health` runs a real
-  one-token generation, so polling it at cadence would make the monitor
-  itself a permanent ~1 token/s of load on an idle server. `/ping` is an
+- **Read-only, and it means it**: polls `/metrics`, `/ping`, `/server_info`,
+  `/v1/models`, and `/v1/loads` with GET requests only. It never proxies,
+  inspects, or modifies inference traffic and never controls the server. In
+  particular it never calls `/health`, because on some server setups that
+  runs a real one-token generation, so a monitor polling it at cadence would
+  be a permanent ~1 token/s load on an idle server. `/ping` is an
   unconditional 200 and costs nothing.
 - **Works even without `--enable-metrics`**: full dashboards need the
   server's Prometheus metrics, but when `/metrics` is 404 sglangtop
@@ -57,7 +66,8 @@ control, telemetry.
 
 ## Install
 
-Requires stable Rust (1.88+): <https://rustup.rs>
+Binary releases (static musl, x86_64 + aarch64, SHA-256-verified installer)
+are planned; until the first release is tagged, build from source:
 
 ```bash
 git clone https://github.com/yongzane00/sglangtop && cd sglangtop
@@ -65,8 +75,8 @@ cargo build --release
 ./target/release/sglangtop --help
 ```
 
-`cargo install --path .` also works. Binary releases (musl x86_64 +
-aarch64, SHA-256-verified installer) are planned.
+Requires stable Rust (1.88+): <https://rustup.rs>. `cargo install --path .`
+also works.
 
 ## Usage
 
@@ -130,6 +140,18 @@ Without it, sglangtop still shows live gauges via `/v1/loads` (badged
 `LOADS`) and tells you what's missing. PD-disaggregated deployments are two
 endpoints (prefill + decode), each badged with its role. Speculative
 decoding, when active, adds accept-rate/accept-length stats and a chart.
+
+## Documentation & contributing
+
+Deeper material lives in [docs/](docs/README.md): the curated metric table,
+the verified SGLang metric semantics, how the 30-day usage numbers are
+computed, and an FAQ of the questions that shaped the design.
+
+The project is young. The most useful contribution right now is running
+sglangtop against your own SGLang version or backend, reporting what shows
+`--` (or something wrong), and sending the `/metrics` capture. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and what CI
+enforces.
 
 ## Compatibility
 

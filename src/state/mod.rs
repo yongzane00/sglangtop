@@ -1,6 +1,7 @@
 //! Application state: one `AppState` owned by the main loop, updated by
 //! reducing collector events, read by the renderer. No locks, no sharing.
 
+pub mod events;
 pub mod history;
 pub mod requests;
 
@@ -22,6 +23,7 @@ pub mod series_id {
     pub const GENERATION_TPS: &str = "generation_tps";
     pub const REQUEST_RATE: &str = "request_rate";
     pub const CACHE_HIT_RATE: &str = "cache_hit_rate";
+    pub const TTFT_P50: &str = "ttft_p50";
     pub const TTFT_P95: &str = "ttft_p95";
     pub const ITL_P95: &str = "itl_p95";
     pub const E2E_P95: &str = "e2e_p95";
@@ -38,6 +40,7 @@ pub mod series_id {
         GENERATION_TPS,
         REQUEST_RATE,
         CACHE_HIT_RATE,
+        TTFT_P50,
         TTFT_P95,
         ITL_P95,
         E2E_P95,
@@ -81,7 +84,7 @@ pub struct ScrapePayload {
     pub metrics: Option<ScrapeText>,
     pub healthy: Option<bool>,
     pub server_info: Option<ServerInfo>,
-    pub models: Option<Vec<String>>,
+    pub models: Option<Vec<ServedModel>>,
     /// `/v1/loads` snapshot, shipped INSTEAD of `metrics` when the server
     /// has `--enable-metrics` off (never both — no dual-source merging).
     pub loads: Option<crate::metrics::loads::LoadsResponse>,
@@ -124,6 +127,17 @@ impl ServerInfo {
             _ => None,
         }
     }
+}
+
+/// One model card from `/v1/models`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedModel {
+    /// The served name.
+    pub id: String,
+    /// Underlying HF repo id or local filesystem path, when reported.
+    pub root: Option<String>,
+    /// Context window. SGLang also exports this as `sglang:context_len`.
+    pub max_model_len: Option<u64>,
 }
 
 /// Windowed/derived values for one series.
@@ -187,7 +201,7 @@ pub struct EndpointState {
     pub server_version: Option<String>,
     /// Last `/server_info` snapshot (metadata cadence; None until probed).
     pub server_info: Option<ServerInfo>,
-    pub served_models: Vec<String>,
+    pub served_models: Vec<ServedModel>,
     /// `/health` result: None = never checked / unknown.
     pub healthy: Option<bool>,
     /// Monotonic start time of the most recent `/metrics` attempt.
@@ -216,6 +230,9 @@ pub struct EndpointState {
     /// Recent requests from the (opt-in) log tailer. Prompt previews live
     /// only here — see `state::requests` for the privacy firewall.
     pub requests: requests::RequestLog,
+    /// Things sglangtop observed about this endpoint (connect, fail,
+    /// restart, retraction, aborts). Bounded; see `state::events`.
+    pub events: events::EventLog,
 
     counters: CounterBank<(SeriesKey, String)>,
     windows: HashMap<(SeriesKey, &'static str), HistogramWindow>,
@@ -256,6 +273,7 @@ impl EndpointState {
             restart_seen_at: None,
             history: HashMap::new(),
             requests: requests::RequestLog::default(),
+            events: events::EventLog::default(),
             counters: CounterBank::new(),
             windows: HashMap::new(),
             missing_scrapes: HashMap::new(),
@@ -290,11 +308,36 @@ impl EndpointState {
                     ConnStatus::Failing { consecutive, .. } => consecutive + 1,
                     _ => 1,
                 };
+                // Only the first failure of a run is an event; a flapping
+                // endpoint must not flood the feed.
+                if consecutive == 1 {
+                    self.events
+                        .push(outcome.at, events::EventKind::Failed, error.clone());
+                }
                 self.status = ConnStatus::Failing { error, consecutive };
                 // Deliberately keep raw/curated/derived: last good snapshot
                 // stays visible, flagged stale via freshness().
             }
             Ok(payload) => {
+                match &self.status {
+                    ConnStatus::Failing { consecutive, .. } => {
+                        let n = *consecutive;
+                        self.events.push(
+                            outcome.at,
+                            events::EventKind::Recovered,
+                            format!("scraping again after {n} failed attempt(s)"),
+                        );
+                    }
+                    // First ever success.
+                    _ if self.last_ok_at.is_none() => {
+                        self.events.push(
+                            outcome.at,
+                            events::EventKind::Connected,
+                            "first successful scrape".to_string(),
+                        );
+                    }
+                    _ => {}
+                }
                 self.status = ConnStatus::Connected;
                 if let Some(healthy) = payload.healthy {
                     self.healthy = Some(healthy);
@@ -333,7 +376,7 @@ impl EndpointState {
         &mut self,
         healthy: Option<bool>,
         server_info: Option<ServerInfo>,
-        models: Option<Vec<String>>,
+        models: Option<Vec<ServedModel>>,
     ) {
         if let Some(healthy) = healthy {
             self.healthy = Some(healthy);
@@ -376,7 +419,7 @@ impl EndpointState {
         let model = self
             .served_models
             .first()
-            .cloned()
+            .map(|m| m.id.clone())
             .or_else(|| {
                 self.server_info
                     .as_ref()
@@ -558,9 +601,38 @@ impl EndpointState {
         self.derived = derived;
         self.curated = Some(curated);
 
+        // Observations worth remembering, all from deltas just computed — no
+        // extra scraping. These live in `ingest_curated` rather than
+        // `ingest_metrics` so the /v1/loads fallback path raises them too.
+        let retracted: f64 = self
+            .derived
+            .values()
+            .filter_map(|d| d.retraction_delta)
+            .sum();
+        if retracted > 0.0 {
+            self.events.push(
+                at,
+                events::EventKind::Preemption,
+                format!("{retracted:.0} request(s) retracted (decode OOM)"),
+            );
+        }
+        let aborted: f64 = self.derived.values().filter_map(|d| d.abort_delta).sum();
+        if aborted > 0.0 {
+            self.events.push(
+                at,
+                events::EventKind::Errors,
+                format!("{aborted:.0} request(s) aborted"),
+            );
+        }
+
         // Track session peaks of the aggregate rates; a server restart
         // invalidates earlier peaks along with everything else cumulative.
         if self.derived.values().any(|d| d.reset_detected) {
+            self.events.push(
+                at,
+                events::EventKind::Restarted,
+                "counters reset — server restarted".to_string(),
+            );
             self.peak_generation_tps = None;
             self.peak_prompt_tps = None;
         }
@@ -606,7 +678,9 @@ impl EndpointState {
             let d = self.derived.get(key);
             let est =
                 |h: &str| -> Option<f64> { d.and_then(|d| d.estimates.get(h)).and_then(|e| e.p95) };
-            let pairs: [(&'static str, Option<f64>); 13] = [
+            let est_p50 =
+                |h: &str| -> Option<f64> { d.and_then(|d| d.estimates.get(h)).and_then(|e| e.p50) };
+            let pairs: [(&'static str, Option<f64>); 14] = [
                 (series_id::RUNNING, series.running),
                 (series_id::WAITING, series.waiting),
                 (series_id::KV_USAGE, series.kv_cache_usage),
@@ -614,6 +688,10 @@ impl EndpointState {
                 (series_id::GENERATION_TPS, d.and_then(|d| d.generation_tps)),
                 (series_id::REQUEST_RATE, d.and_then(|d| d.request_rate)),
                 (series_id::CACHE_HIT_RATE, series.cache_hit_rate_recent),
+                (
+                    series_id::TTFT_P50,
+                    est_p50(crate::metrics::normalize::hist::TTFT),
+                ),
                 (
                     series_id::TTFT_P95,
                     est(crate::metrics::normalize::hist::TTFT),
@@ -782,6 +860,89 @@ fn sum_opt(acc: &mut Option<f64>, v: Option<f64>) {
     if let Some(v) = v {
         *acc = Some(acc.unwrap_or(0.0) + v);
     }
+}
+
+/// Fleet-wide roll-up across endpoints, for the fleet view's card band.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FleetAggregate {
+    pub endpoints_total: usize,
+    /// Fresh and not reporting unhealthy.
+    pub endpoints_up: usize,
+    pub endpoints_stale: usize,
+    /// Never connected, or currently failing.
+    pub endpoints_down: usize,
+    pub running: Option<f64>,
+    pub waiting: Option<f64>,
+    pub prompt_tps: Option<f64>,
+    pub generation_tps: Option<f64>,
+    /// True when any contributing endpoint used the server's own throughput
+    /// gauge rather than counter-derived rates.
+    pub generation_tps_is_estimate: bool,
+    pub request_rate: Option<f64>,
+    pub abort_delta: Option<f64>,
+    pub kv_usage: Option<KvAggregate>,
+    pub worst_ttft_p95: Option<f64>,
+    /// Which endpoint owns `worst_ttft_p95` — a fleet number is only
+    /// actionable if you know where to look.
+    pub worst_ttft_endpoint: Option<String>,
+}
+
+/// Roll up the fleet. Counts sum; KV goes through [`aggregate_kv`] over the
+/// FLATTENED fleet-wide (usage, capacity) pairs, so weighting happens at the
+/// series level and never as a mean of means; latencies take the worst and
+/// name the endpoint.
+///
+/// Freshness is supplied by the caller rather than computed here, which keeps
+/// this clock-free and unit-testable. Only `Fresh` endpoints contribute
+/// activity numbers — a stale snapshot must not inflate fleet totals — but
+/// every endpoint is counted in the status tallies.
+pub fn aggregate_fleet<'a>(
+    endpoints: impl Iterator<Item = (&'a EndpointState, Freshness)>,
+) -> FleetAggregate {
+    let mut agg = FleetAggregate::default();
+    let mut kv_pairs: Vec<(f64, Option<f64>)> = Vec::new();
+
+    for (e, freshness) in endpoints {
+        agg.endpoints_total += 1;
+        match freshness {
+            Freshness::Fresh if e.healthy != Some(false) => agg.endpoints_up += 1,
+            Freshness::Fresh => agg.endpoints_down += 1,
+            Freshness::Stale => agg.endpoints_stale += 1,
+            Freshness::Never => agg.endpoints_down += 1,
+        }
+        if freshness != Freshness::Fresh {
+            continue;
+        }
+
+        let e_agg = e.aggregate();
+        sum_opt(&mut agg.running, e_agg.running);
+        sum_opt(&mut agg.waiting, e_agg.waiting);
+        sum_opt(&mut agg.prompt_tps, e_agg.prompt_tps);
+        sum_opt(&mut agg.generation_tps, e_agg.generation_tps);
+        sum_opt(&mut agg.request_rate, e_agg.request_rate);
+        sum_opt(&mut agg.abort_delta, e_agg.abort_delta);
+        // One estimated contributor taints the fleet total: it is no longer
+        // purely counter-derived.
+        agg.generation_tps_is_estimate |= e_agg.generation_tps_is_estimate;
+
+        if let Some(worst) = e_agg.worst_ttft_p95
+            && agg.worst_ttft_p95.is_none_or(|cur| worst > cur)
+        {
+            agg.worst_ttft_p95 = Some(worst);
+            agg.worst_ttft_endpoint = Some(e.name.clone());
+        }
+
+        if let Some(curated) = &e.curated {
+            for series in curated.series.values() {
+                if let Some(usage) = series.kv_cache_usage {
+                    kv_pairs.push((usage, series.kv_cache_size_tokens));
+                }
+            }
+        }
+    }
+
+    agg.kv_usage = aggregate_kv(&kv_pairs);
+    agg
 }
 
 fn to_point(raw: &RawHistogram, at: Instant) -> Option<HistogramPoint> {
@@ -1030,7 +1191,11 @@ sglang:cached_tokens_total{{cache_source="device",engine_type="unified",model_na
     fn server_estimated_throughput_never_sets_a_session_peak() {
         let base = Instant::now();
         let mut e = ep();
-        e.served_models = vec!["m".into()];
+        e.served_models = vec![ServedModel {
+            id: "m".into(),
+            root: None,
+            max_model_len: None,
+        }];
         let loads: crate::metrics::loads::LoadsResponse = serde_json::from_str(
             r#"{"loads":[{"dp_rank":0,"num_running_reqs":1,"gen_throughput":500.0}]}"#,
         )

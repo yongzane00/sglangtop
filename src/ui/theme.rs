@@ -7,6 +7,7 @@
 //!   comes only from bold/dim modifiers so every value stays readable.
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
@@ -137,6 +138,36 @@ impl Theme {
             key: Style::default().add_modifier(Modifier::BOLD),
             tab_active: Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
             tab_inactive: Style::default().add_modifier(Modifier::DIM),
+        }
+    }
+
+    /// Whether to draw ASCII-only glyphs instead of box/block drawing.
+    ///
+    /// Today this is exactly "monochrome mode", which is also the mode a
+    /// terminal without good Unicode coverage gets. The seam exists so a
+    /// future `--ascii` flag is a one-line change here instead of a hunt
+    /// through every renderer.
+    pub fn ascii(&self) -> bool {
+        self.mode == ColorMode::Mono
+    }
+
+    /// Marker for the n-th line overlaid on one chart. Colour alone cannot
+    /// separate lines in monochrome, so the marker varies per line too.
+    pub fn series_marker(&self, index: usize) -> Marker {
+        if index == 0 {
+            Marker::Braille
+        } else {
+            Marker::Dot
+        }
+    }
+
+    /// Legend glyph mirroring [`Self::series_marker`].
+    pub fn legend_glyph(&self, index: usize) -> &'static str {
+        match (self.ascii(), index) {
+            (true, 0) => "-",
+            (true, _) => ".",
+            (false, 0) => "▬",
+            (false, _) => "·",
         }
     }
 

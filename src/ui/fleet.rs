@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::app::App;
 use crate::state::Freshness;
 use crate::storage::usage::{DayUsage, USAGE_WINDOW_DAYS};
-use crate::ui::{format, freshness_badge};
+use crate::ui::{cards, format, freshness_badge};
 
 /// A chart row needs this many terminal rows to be readable; below that the
 /// charts section is dropped and the table gets everything.
@@ -19,6 +19,122 @@ const MIN_CHART_ROWS: u16 = 8;
 const MIN_USAGE_ROWS: u16 = 7;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+    // The card tier is strictly ADDITIVE: it appears only when today's full
+    // stack (table + usage bars + chart grid) still fits with a card row to
+    // spare, so no size that renders something today loses anything.
+    let table_needed = (app.endpoints.len() as u16).saturating_add(1);
+    let table_h = table_needed.min((area.height / 2).max(1));
+    let avail = area.height.saturating_sub(table_h);
+    let usage0 = (avail / 3).clamp(MIN_USAGE_ROWS, 12);
+    let cards_h =
+        if cards::columns(area.width) > 0 && avail >= usage0 + MIN_CHART_ROWS + cards::CARD_H {
+            cards::CARD_H
+        } else {
+            0
+        };
+
+    let [cards_area, body] =
+        Layout::vertical([Constraint::Length(cards_h), Constraint::Min(0)]).areas(area);
+    if cards_h > 0 {
+        let now = Instant::now();
+        let fleet = crate::state::aggregate_fleet(
+            app.endpoints
+                .iter()
+                .map(|e| (e, e.freshness(now, app.refresh_interval))),
+        );
+        cards::draw_card_row(frame, &app.theme, cards_area, &fleet_cards(app, &fleet));
+    }
+    draw_body(frame, app, body);
+}
+
+/// Fleet-wide cards. Counts sum, KV is capacity-weighted where possible and
+/// says so, and the worst latency names the endpoint that owns it.
+fn fleet_cards(app: &App, fleet: &crate::state::FleetAggregate) -> Vec<cards::Card> {
+    let t = &app.theme;
+
+    let health_style = if fleet.endpoints_down > 0 {
+        t.crit
+    } else if fleet.endpoints_stale > 0 {
+        t.warn
+    } else {
+        t.value
+    };
+    let mut notes: Vec<String> = Vec::new();
+    if fleet.endpoints_stale > 0 {
+        notes.push(format!("{} stale", fleet.endpoints_stale));
+    }
+    if fleet.endpoints_down > 0 {
+        notes.push(format!("{} down", fleet.endpoints_down));
+    }
+    let endpoints = cards::Card::text(
+        t,
+        "ENDPOINTS",
+        Some(format!("{}/{}", fleet.endpoints_up, fleet.endpoints_total)),
+    )
+    .style(health_style)
+    .sub(
+        (!notes.is_empty()).then(|| notes.join(" · ")),
+        if fleet.endpoints_down > 0 {
+            t.crit
+        } else {
+            t.warn
+        },
+    );
+
+    let waiting = fleet.waiting.unwrap_or(0.0);
+    let running = cards::Card::count(t, "RUNNING", fleet.running, None).sub(
+        fleet
+            .waiting
+            .map(|w| format!("{} queued", format::count(Some(w)))),
+        if waiting > 0.0 { t.warn } else { t.dim },
+    );
+
+    // A `~` marks a total that includes any server-estimated throughput.
+    let gen_value = fleet.generation_tps.map(|v| {
+        if fleet.generation_tps_is_estimate {
+            format!("~{}", format::count(Some(v)))
+        } else {
+            format::count(Some(v))
+        }
+    });
+    let generation = cards::Card::text(t, "GENERATION", gen_value).sub(
+        (fleet.endpoints_up > 0).then(|| format!("over {} up", fleet.endpoints_up)),
+        t.dim,
+    );
+
+    // The fleet table marks an unweighted KV figure with `~`; here there is
+    // room to say it in words.
+    let kv = cards::Card::percent(t, "KV CACHE", fleet.kv_usage.map(|k| k.value()), 0.75, 0.9).sub(
+        fleet.kv_usage.map(|k| {
+            if k.is_weighted() {
+                "capacity-weighted".to_string()
+            } else {
+                "unweighted mean".to_string()
+            }
+        }),
+        if fleet.kv_usage.is_some_and(|k| k.is_weighted()) {
+            t.dim
+        } else {
+            t.warn
+        },
+    );
+
+    let ttft = cards::Card::seconds(t, "WORST TTFT", fleet.worst_ttft_p95).sub(
+        fleet
+            .worst_ttft_endpoint
+            .as_ref()
+            .map(|name| format!("on {name}")),
+        t.dim,
+    );
+
+    let prompt = cards::Card::count(t, "PROMPT", fleet.prompt_tps, Some("tok/s"));
+
+    vec![endpoints, running, generation, kv, ttft, prompt]
+}
+
+/// Today's ladder, unchanged: table, then the 30-day usage bars, then the
+/// rolling chart grid, dropping the grid first and the bars second.
+fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     // Table gets exactly what it needs (header + one row per endpoint, at
     // most half the space). Below it: daily usage bars, then the rolling
     // chart grid. Degrade order as the terminal shrinks: grid first, then
@@ -179,6 +295,21 @@ fn draw_usage_chart(
     // read as different charts. Slot widths now differ by at most one
     // column. When even one column per day cannot fit, show only the most
     // recent days (labelled in the title).
+    if days.is_empty() {
+        // No recorded days yet. `TapeGeometry::new` clamps `fit` to at least
+        // 1, so `days.len() - fit` below would underflow; guard on the real
+        // condition rather than on `fit`.
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(" no usage recorded yet", t.na))).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(t.dim)
+                    .title(Span::styled(format!(" {title} "), t.heading)),
+            ),
+            area,
+        );
+        return;
+    }
     let geo = TapeGeometry::new(inner_w, days.len());
     let fit = geo.fit;
     let shown = &days[days.len() - fit..];
