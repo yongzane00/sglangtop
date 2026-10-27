@@ -2,12 +2,16 @@
 
 pub mod cards;
 pub mod charts;
+pub mod dial;
 pub mod endpoint;
 pub mod fleet;
 pub mod format;
 pub mod help;
+pub mod kvbar;
 pub mod panels;
+pub mod seats;
 pub mod theme;
+pub mod tokens;
 
 #[cfg(test)]
 mod tests;

@@ -16,9 +16,13 @@ use crate::ui::theme::Theme;
 
 /// Sizes from "generous desktop" down to absurd. Nothing may panic at any of
 /// them; the small ones exist purely to prove the ladder bottoms out safely.
-const SIZES: [(u16, u16); 7] = [
+const SIZES: [(u16, u16); 10] = [
     (200, 50),
     (160, 44),
+    // Portrait: a terminal on a vertical monitor, full and half height.
+    (110, 95),
+    (110, 44),
+    (90, 60),
     (120, 30),
     (100, 24),
     (80, 20),
@@ -67,8 +71,9 @@ fn endpoint_renders_in_every_panel_mode_at_every_size() {
         app.panel_mode = mode;
         for (w, h) in SIZES {
             let out = text(&render(&app, w, h));
-            if w >= 120 && h >= 24 {
-                assert!(out.contains("RUNNING"), "{mode:?} {w}x{h}: {out}");
+            if w >= 60 && h >= 24 {
+                assert!(out.contains("SEATS"), "{mode:?} {w}x{h}: {out}");
+                assert!(out.contains("KV"), "{mode:?} {w}x{h}: {out}");
                 assert!(out.contains(mode.label()), "{mode:?} {w}x{h}: {out}");
             }
         }
@@ -76,21 +81,86 @@ fn endpoint_renders_in_every_panel_mode_at_every_size() {
 }
 
 #[test]
-fn overview_shows_cards_charts_and_the_detail_band_when_wide() {
+fn overview_shows_every_instrument_wide_and_in_portrait() {
     let mut app = app_with_fixture(&["http://h1:1"]);
     app.view = View::Endpoint(0);
-    let out = text(&render(&app, 200, 50));
-    for expected in [
-        "STATUS",
-        "KV CACHE",
-        "RUNNING",
-        "GENERATION",
-        "tokens/s",
-        "percentiles",
-        "server & model",
-    ] {
+    for (w, h) in [(200, 50), (110, 44), (110, 95)] {
+        let out = text(&render(&app, w, h));
+        for expected in [
+            "KV CACHE",
+            "SEATS",
+            "tokens/s",
+            "out",
+            "TTFT p50",
+            "TTFT p95",
+            "percentiles",
+            "server & model",
+        ] {
+            assert!(out.contains(expected), "{w}x{h} missing {expected}:\n{out}");
+        }
+    }
+    // A tall portrait terminal has room for the events feed too.
+    let out = text(&render(&app, 110, 95));
+    assert!(out.contains("events"), "{out}");
+}
+
+#[test]
+fn a_small_terminal_gets_one_line_gauges() {
+    let mut app = app_with_fixture(&["http://h1:1"]);
+    app.view = View::Endpoint(0);
+    let out = text(&render(&app, 80, 22));
+    for expected in ["KV ", "SEATS ", "TTFT ", "tokens/s"] {
         assert!(out.contains(expected), "missing {expected}:\n{out}");
     }
+    assert!(!out.contains("KV CACHE"), "{out}");
+}
+
+#[test]
+fn the_tokens_panel_lists_prompts_as_a_ledger() {
+    // The fixture's second scrape bumps the prompt-token counter by 10%
+    // (7.3k tokens) and the request counter by half a request, which rounds
+    // to one: a single-request ledger row with its share of the 262k
+    // context window and a window total, under the generation band.
+    let mut app = app_with_fixture(&["http://h1:1"]);
+    app.view = View::Endpoint(0);
+    for (w, h) in [(110, 44), (110, 95), (200, 50)] {
+        let out = text(&render(&app, w, h));
+        for expected in ["out", "in", "Σ", "7.3k", "3% ctx"] {
+            assert!(out.contains(expected), "{w}x{h} missing {expected}:\n{out}");
+        }
+        assert!(!out.contains("no prompts"), "{out}");
+        // Half a request rounds to one, so the row names no count.
+        assert!(!out.contains("reqs"), "{out}");
+    }
+}
+
+#[test]
+fn the_removed_charts_stay_removed() {
+    // KV is a bar now; inter-token latency and completions/s live in the
+    // percentiles table and the fleet grid, not the endpoint overview.
+    let mut app = app_with_fixture(&["http://h1:1"]);
+    app.view = View::Endpoint(0);
+    for (w, h) in [(200, 50), (110, 95)] {
+        let out = text(&render(&app, w, h));
+        assert!(!out.contains("completions/s"), "{out}");
+        assert!(!out.contains("inter-token p95"), "{out}");
+    }
+}
+
+#[test]
+fn a_declared_cap_fills_the_seat_grid() {
+    let mut app = app_with_fixture(&["http://h1:1"]);
+    app.config.endpoints[0].max_running = Some(12);
+    app.theme = Theme::truecolor();
+    app.view = View::Endpoint(0);
+    let out = text(&render(&app, 110, 44));
+    assert!(out.contains("/ 12 running"), "{out}");
+    assert!(out.contains('\u{25a1}'), "{out}");
+    // Without one, the title asks for it and no empty seat is drawn.
+    app.config.endpoints[0].max_running = None;
+    let out = text(&render(&app, 110, 44));
+    assert!(out.contains("cap ? (add @N)"), "{out}");
+    assert!(!out.contains('\u{25a1}'), "{out}");
 }
 
 #[test]

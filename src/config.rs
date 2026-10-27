@@ -28,6 +28,9 @@ pub const DEFAULT_REFRESH_MS: u64 = 1000;
 pub const DEFAULT_HISTORY_SECS: u64 = 300;
 pub const DEFAULT_PERCENTILE_WINDOW_SECS: u64 = 60;
 pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+/// TTFT dial zones: amber from 2 s, red from 10 s.
+pub const DEFAULT_TTFT_WARN_MS: u64 = 2_000;
+pub const DEFAULT_TTFT_CRIT_MS: u64 = 10_000;
 
 /// The minimum target *start* cadence. Faster settings would collapse the
 /// fixed 0/250/500/750 ms fleet phases and overload monitored servers.
@@ -63,6 +66,8 @@ pub enum ConfigError {
     },
     #[error("no endpoints configured")]
     NoEndpoints,
+    #[error("ttft_warn_ms = {warn} must be below ttft_crit_ms = {crit}")]
+    TtftOrder { warn: u64, crit: u64 },
 }
 
 /// One endpoint, fully validated.
@@ -74,9 +79,9 @@ pub struct EndpointConfig {
     pub bearer_token_env: Option<String>,
     /// Header name → env var NAME holding the header value.
     pub header_env: BTreeMap<String, String>,
-    /// The server's `--max-running-requests`, declared by the user. When set,
-    /// running requests render as an `n/max` bar; overrides the value the
-    /// server itself reports via `/server_info`.
+    /// Override for the server's `--max-running-requests`, which the seat
+    /// grid otherwise reads from `/server_info`. When set, it wins; per
+    /// engine on a data-parallel server.
     pub max_running: Option<u32>,
     /// Path to the SGLang server's stdout log (read-only, local, opt-in).
     /// The SGLang log grammar is not parsed yet; the pane shows guidance.
@@ -140,6 +145,10 @@ pub struct Config {
     pub history_window: Duration,
     pub percentile_window: Duration,
     pub retention_days: u32,
+    /// TTFT dial thresholds, in seconds: amber at `ttft_warn`, red at
+    /// `ttft_crit`.
+    pub ttft_warn: f64,
+    pub ttft_crit: f64,
     pub record: RecordSetting,
     pub no_color: bool,
     pub endpoints: Vec<EndpointConfig>,
@@ -177,6 +186,9 @@ struct FileConfig {
     history_seconds: Option<u64>,
     percentile_window_seconds: Option<u64>,
     retention_days: Option<u32>,
+    /// TTFT dial zone thresholds, in milliseconds.
+    ttft_warn_ms: Option<u64>,
+    ttft_crit_ms: Option<u64>,
     /// Recording destination; overrides the default data-dir path.
     record_path: Option<PathBuf>,
     /// `true` disables recording (and the daily-usage charts).
@@ -193,7 +205,7 @@ struct FileEndpoint {
     bearer_token_env: Option<String>,
     #[serde(default)]
     header_env: BTreeMap<String, String>,
-    /// Mirror of the server's `--max-running-requests`, for the running bar.
+    /// Override for the server's `--max-running-requests`, for the seat grid.
     max_running: Option<u32>,
     /// SGLang stdout log to tail (local, read-only; grammar not parsed yet).
     log_file: Option<PathBuf>,
@@ -285,6 +297,17 @@ fn merge(
         .unwrap_or(DEFAULT_RETENTION_DAYS);
     check_range("retention_days", u64::from(retention_days), 1, 3_650)?;
 
+    let ttft_warn_ms = file.ttft_warn_ms.unwrap_or(DEFAULT_TTFT_WARN_MS);
+    let ttft_crit_ms = file.ttft_crit_ms.unwrap_or(DEFAULT_TTFT_CRIT_MS);
+    check_range("ttft_warn_ms", ttft_warn_ms, 1, 600_000)?;
+    check_range("ttft_crit_ms", ttft_crit_ms, 1, 600_000)?;
+    if ttft_warn_ms >= ttft_crit_ms {
+        return Err(ConfigError::TtftOrder {
+            warn: ttft_warn_ms,
+            crit: ttft_crit_ms,
+        });
+    }
+
     // CLI endpoints replace the file list entirely.
     let endpoints = if !cli.endpoints.is_empty() {
         cli.endpoints
@@ -336,6 +359,8 @@ fn merge(
         history_window: Duration::from_secs(history_secs),
         percentile_window: Duration::from_secs(percentile_secs),
         retention_days,
+        ttft_warn: ttft_warn_ms as f64 / 1000.0,
+        ttft_crit: ttft_crit_ms as f64 / 1000.0,
         record,
         no_color: cli.no_color,
         endpoints,
@@ -368,7 +393,7 @@ fn default_endpoint() -> EndpointConfig {
 
 /// Parse a `--endpoint` argument: `NAME=URL` or bare `URL`, optionally with
 /// a trailing `@CAP` (`NAME=URL@8`) declaring the server's `--max-num-seqs`
-/// for the running `n/max` bar — same as `max_running` in the config file.
+/// for the seat grid — same as `max_running` in the config file.
 /// A `=` only counts as the name separator when it appears before `://`; an
 /// `@` only counts as the cap separator when everything after it is digits,
 /// so userinfo-style URLs cannot false-match.
@@ -516,6 +541,35 @@ mod tests {
         // No env at all: recording cannot resolve a default path, and the
         // reason is preserved for display.
         assert!(matches!(cfg.record, RecordSetting::Unavailable(_)));
+    }
+
+    #[test]
+    fn ttft_thresholds_default_and_validate() {
+        let cfg = load(&cli(&[]), no_env).unwrap();
+        assert_eq!((cfg.ttft_warn, cfg.ttft_crit), (2.0, 10.0));
+
+        let file: FileConfig = toml::from_str(
+            "ttft_warn_ms = 500
+ttft_crit_ms = 3000",
+        )
+        .unwrap();
+        let merged = merge(&cli(&[]), file, None).unwrap();
+        assert_eq!((merged.ttft_warn, merged.ttft_crit), (0.5, 3.0));
+
+        let file: FileConfig = toml::from_str(
+            "ttft_warn_ms = 5000
+ttft_crit_ms = 5000",
+        )
+        .unwrap();
+        assert!(matches!(
+            merge(&cli(&[]), file, None),
+            Err(ConfigError::TtftOrder { .. })
+        ));
+        let file: FileConfig = toml::from_str("ttft_crit_ms = 0").unwrap();
+        assert!(matches!(
+            merge(&cli(&[]), file, None),
+            Err(ConfigError::OutOfRange { .. })
+        ));
     }
 
     #[test]

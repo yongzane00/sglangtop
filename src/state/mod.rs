@@ -1,6 +1,7 @@
 //! Application state: one `AppState` owned by the main loop, updated by
 //! reducing collector events, read by the renderer. No locks, no sharing.
 
+pub mod bursts;
 pub mod events;
 pub mod history;
 pub mod requests;
@@ -230,6 +231,9 @@ pub struct EndpointState {
     /// Recent requests from the (opt-in) log tailer. Prompt previews live
     /// only here — see `state::requests` for the privacy firewall.
     pub requests: requests::RequestLog,
+    /// The prompts of the requests that finished, one entry per scrape
+    /// interval that showed new prompt tokens; see `state::bursts`.
+    pub bursts: bursts::BurstLog,
     /// Things sglangtop observed about this endpoint (connect, fail,
     /// restart, retraction, aborts). Bounded; see `state::events`.
     pub events: events::EventLog,
@@ -273,6 +277,7 @@ impl EndpointState {
             restart_seen_at: None,
             history: HashMap::new(),
             requests: requests::RequestLog::default(),
+            bursts: bursts::BurstLog::new(history_window),
             events: events::EventLog::default(),
             counters: CounterBank::new(),
             windows: HashMap::new(),
@@ -433,6 +438,11 @@ impl EndpointState {
     fn ingest_curated(&mut self, curated: CuratedScrape, at: Instant) {
         self.counters.begin_scrape();
         let mut derived: BTreeMap<SeriesKey, DerivedSeries> = BTreeMap::new();
+        // Prompt tokens, and prompts, of the requests that finished this
+        // interval, summed over series; `None` as soon as any series cannot
+        // say.
+        let mut landed_tokens: Option<f64> = Some(0.0);
+        let mut landed_prompts: Option<f64> = Some(0.0);
 
         for (key, series) in &curated.series {
             let mut d = DerivedSeries::default();
@@ -492,16 +502,19 @@ impl EndpointState {
             // Completions: rate per is_streaming child, summed where
             // available, with the same family-consistency rule.
             let mut total_rate: Option<f64> = None;
+            let mut finished_delta: Option<f64> = None;
             let mut requests_reset = false;
             for (streaming, value) in &series.requests_by_stream {
                 let s = rate_of(&format!("requests:{streaming}"), Some(*value));
                 requests_reset |= s.is_reset();
-                if let RateSample::Rate { per_sec, .. } = s {
+                if let RateSample::Rate { per_sec, delta } = s {
                     *total_rate.get_or_insert(0.0) += per_sec;
+                    *finished_delta.get_or_insert(0.0) += delta;
                 }
             }
             if requests_reset {
                 total_rate = None;
+                finished_delta = None;
             }
             d.request_rate = total_rate;
 
@@ -545,6 +558,19 @@ impl EndpointState {
                 _ => None,
             };
 
+            // SGLang adds a request's whole prompt to `prompt_tokens_total`
+            // and ticks `num_requests_total` in the same call, once, as the
+            // request finishes: this interval's deltas are the prompts of
+            // the requests that finished, and how many they were.
+            landed_tokens = match (landed_tokens, prompt_delta) {
+                (Some(a), Some(b)) if !share_reset => Some(a + b),
+                _ => None,
+            };
+            landed_prompts = match (landed_prompts, finished_delta) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+
             // Histogram windows.
             for (canonical, raw_histogram) in &series.histograms {
                 if let Some(point) = to_point(raw_histogram, at) {
@@ -566,6 +592,10 @@ impl EndpointState {
             derived.insert(key.clone(), d);
         }
         self.counters.end_scrape();
+
+        if let Some(tokens) = landed_tokens {
+            self.bursts.push(at, tokens, landed_prompts);
+        }
 
         // Age out series missing from this scrape instead of dropping them
         // immediately. A series can vanish for one scrape without the server
@@ -1018,6 +1048,49 @@ sglang:num_aborted_requests_total{{engine_type="unified",model_name="m"}} {finis
             engine_type: None,
             dp_rank: None,
         }
+    }
+
+    #[test]
+    fn prompt_bursts_come_from_finish_time_counter_deltas() {
+        // SGLang bumps prompt_tokens_total and num_requests_total together
+        // as each request finishes: the deltas are whole prompts and how
+        // many requests they belonged to.
+        let base = Instant::now();
+        let mut e = ep();
+        e.apply(scrape(base, 0.0, &metrics_text(1000.0, 500.0, 10.0, 0.0)));
+        assert!(e.bursts.is_empty(), "no interval yet");
+        e.apply(scrape(base, 1.0, &metrics_text(1000.0, 500.0, 10.0, 0.0)));
+        assert!(e.bursts.is_empty(), "nothing finished");
+        // One request with a 55.2k prompt, then two totalling 9.8k.
+        e.apply(scrape(base, 2.0, &metrics_text(56_200.0, 600.0, 11.0, 0.0)));
+        e.apply(scrape(base, 3.0, &metrics_text(66_000.0, 700.0, 12.0, 1.0)));
+        let now = base + Duration::from_secs(3);
+        let got: Vec<(f64, Option<u32>)> = e
+            .bursts
+            .recent(now)
+            .map(|b| (b.tokens, b.requests))
+            .collect();
+        assert_eq!(got, vec![(9800.0, Some(2)), (55_200.0, Some(1))]);
+        assert_eq!(e.bursts.total_tokens(now), 65_000.0);
+
+        // Without the request counter the tokens are known, the count is not.
+        let only_prompt = |prompt: f64| {
+            format!(
+                r#"
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{{engine_type="unified",is_streaming="true",model_name="m"}} {prompt}
+"#
+            )
+        };
+        let mut e = ep();
+        e.apply(scrape(base, 0.0, &only_prompt(1000.0)));
+        e.apply(scrape(base, 2.0, &only_prompt(1200.0)));
+        let got: Vec<(f64, Option<u32>)> = e
+            .bursts
+            .recent(base + Duration::from_secs(2))
+            .map(|b| (b.tokens, b.requests))
+            .collect();
+        assert_eq!(got, vec![(200.0, None)]);
     }
 
     #[test]

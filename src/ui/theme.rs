@@ -7,7 +7,6 @@
 //!   comes only from bold/dim modifiers so every value stays readable.
 
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
@@ -149,26 +148,6 @@ impl Theme {
     /// through every renderer.
     pub fn ascii(&self) -> bool {
         self.mode == ColorMode::Mono
-    }
-
-    /// Marker for the n-th line overlaid on one chart. Colour alone cannot
-    /// separate lines in monochrome, so the marker varies per line too.
-    pub fn series_marker(&self, index: usize) -> Marker {
-        if index == 0 {
-            Marker::Braille
-        } else {
-            Marker::Dot
-        }
-    }
-
-    /// Legend glyph mirroring [`Self::series_marker`].
-    pub fn legend_glyph(&self, index: usize) -> &'static str {
-        match (self.ascii(), index) {
-            (true, 0) => "-",
-            (true, _) => ".",
-            (false, 0) => "▬",
-            (false, _) => "·",
-        }
     }
 
     /// Distinct color per overlaid series (endpoint lines in shared charts).

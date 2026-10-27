@@ -20,6 +20,11 @@ history_seconds = 300
 # Rolling window for latency percentile estimates, in seconds (5..=3600).
 percentile_window_seconds = 60
 
+# TTFT speedometer zones, in milliseconds (1..=600000; warn below crit).
+# The dial turns amber at ttft_warn_ms and red at ttft_crit_ms.
+ttft_warn_ms = 2000
+ttft_crit_ms = 10000
+
 # Days of history kept in the SQLite database.
 retention_days = 30
 

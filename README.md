@@ -20,11 +20,20 @@ the past 30 days, rolling history. Move with `j`/`k`, open an endpoint with
 
 ![Fleet view](docs/img/fleet.svg)
 
-**Endpoint view** — headline stat cards over six live charts, with
-percentiles, GPU memory and an event feed below. Press `t` to cycle to the
-request log or the full percentile tables.
+**Endpoint view** — a KV-cache bar, one box per scheduler seat (the cap
+comes from the server's own `--max-running-requests`), a generation band
+(an area of braille dots, one scrape per dot, newest at the right edge,
+scaled to the peak on screen), a ledger of recently finished requests —
+how long ago, how many prompt tokens, what share of the context window —
+and TTFT p50/p95 speedometers, with percentiles, server/model facts and
+recent events below. Every plot steps one dot per refresh, in lockstep.
+The layout fits a wide monitor or a tall, narrow terminal on a vertical
+one. Press `t` to cycle to the request log or the full activity/latency
+tables.
 
 ![Endpoint view](docs/img/endpoint.svg)
+
+<img src="docs/img/endpoint-portrait.svg" width="460" alt="Endpoint view on a tall, narrow terminal">
 
 *(Screenshots captured against local mock SGLang servers; the `edge`
 endpoint runs without `--enable-metrics` to show the `/v1/loads` fallback.)*
@@ -90,9 +99,11 @@ sglangtop --no-record                            # disable usage recording
 sglangtop --completions bash                     # shell completions
 ```
 
-The running-requests `n/max` bar is automatic: sglangtop reads the server's
-`--max-running-requests` from `/server_info`. The `@CAP` suffix (or
-`max_running` in the config file) only overrides it.
+The seat grid is automatic: sglangtop reads the server's
+`--max-running-requests` from `/server_info`, so every slot shows, occupied
+or free. The `@CAP` suffix (or `max_running` in the config file) only
+overrides it. The TTFT dials turn amber past `ttft_warn_ms` and red past
+`ttft_crit_ms` (2 s and 10 s unless the config file says otherwise).
 
 Recording is on by default (`~/.local/share/sglangtop/usage.db`, 30-day
 retention) and feeds the fleet's daily-usage charts; `--record PATH`
@@ -122,7 +133,7 @@ bearer_token_env = "SPARK_A_SGLANG_TOKEN"  # name of the variable, not the token
 | `j`/`k`, `Enter` | select / open endpoint (fleet view) |
 | `PgUp`/`PgDn`, wheel | scroll the history charts |
 | `s` | cycle fleet sort column |
-| `t` | endpoint view: charts ⇄ activity/latency tables |
+| `t` | endpoint view: overview → request log → activity/latency tables |
 | `r` | force refresh |
 | `p` | pause display (collection continues) |
 | `+` / `-` | faster / slower refresh |

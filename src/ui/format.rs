@@ -186,6 +186,34 @@ pub fn bar(frac: f64, width: usize, ascii: bool) -> String {
     out
 }
 
+/// A loading bar as `(filled, track)`, together exactly `width` cells. The
+/// filled part uses eighth blocks; the remainder is a visible track, so even
+/// a 2% fill reads against its full scale.
+pub fn bar_track(frac: f64, width: usize, ascii: bool) -> (String, String) {
+    let frac = if frac.is_finite() {
+        frac.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if ascii {
+        let full = ((frac * width as f64).round() as usize).min(width);
+        return ("#".repeat(full), ".".repeat(width - full));
+    }
+    const PARTIALS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let cells = frac * width as f64;
+    let full = (cells.floor() as usize).min(width);
+    let mut filled = "█".repeat(full);
+    let mut used = full;
+    if used < width {
+        let eighths = ((cells - full as f64) * 8.0).floor() as usize;
+        if eighths > 0 {
+            filled.push(PARTIALS[eighths.min(7) - 1]);
+            used += 1;
+        }
+    }
+    (filled, "░".repeat(width - used))
+}
+
 /// Inline sparkline string using ▁▂▃▄▅▆▇█, scaled to the slice's own range.
 /// Takes the most recent `width` values (oldest first).
 pub fn spark(values: &[f64], width: usize, ascii: bool) -> String {
@@ -242,6 +270,32 @@ pub fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_track_always_fills_exactly_the_width() {
+        for width in [0usize, 1, 7, 40] {
+            for frac in [0.0, 0.001, 0.081, 0.5, 0.999, 1.0, 1.7, -0.3, f64::NAN] {
+                for ascii in [false, true] {
+                    let (filled, track) = bar_track(frac, width, ascii);
+                    assert_eq!(
+                        filled.chars().count() + track.chars().count(),
+                        width,
+                        "{frac} {width} {ascii}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bar_track_shows_a_partial_cell_and_a_visible_track() {
+        // 8.1% of 40 cells = 3.24 cells: three full blocks, one sliver.
+        let (filled, track) = bar_track(0.081, 40, false);
+        assert_eq!(filled, "███▏");
+        assert_eq!(track, "░".repeat(36));
+        assert_eq!(bar_track(1.0, 4, false), ("████".into(), String::new()));
+        assert_eq!(bar_track(0.5, 4, true), ("##".into(), "..".into()));
+    }
 
     #[test]
     fn count_formats() {

@@ -26,23 +26,26 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let table_h = table_needed.min((area.height / 2).max(1));
     let avail = area.height.saturating_sub(table_h);
     let usage0 = (avail / 3).clamp(MIN_USAGE_ROWS, 12);
-    let cards_h =
-        if cards::columns(area.width) > 0 && avail >= usage0 + MIN_CHART_ROWS + cards::CARD_H {
-            cards::CARD_H
-        } else {
-            0
-        };
+    let now = Instant::now();
+    let fleet = crate::state::aggregate_fleet(
+        app.endpoints
+            .iter()
+            .map(|e| (e, e.freshness(now, app.refresh_interval))),
+    );
+    let fleet_cards = fleet_cards(app, &fleet);
+    // Every card when there is room for the whole grid (two rows of three on
+    // a portrait terminal), else the one row that fits, else none — each
+    // checked against the same additive condition.
+    let full = cards::card_grid(area.width, fleet_cards.len()).height;
+    let cards_h = [full, cards::CARD_H]
+        .into_iter()
+        .find(|&h| h > 0 && cards::columns(area.width) > 0 && avail >= usage0 + MIN_CHART_ROWS + h)
+        .unwrap_or(0);
 
     let [cards_area, body] =
         Layout::vertical([Constraint::Length(cards_h), Constraint::Min(0)]).areas(area);
     if cards_h > 0 {
-        let now = Instant::now();
-        let fleet = crate::state::aggregate_fleet(
-            app.endpoints
-                .iter()
-                .map(|e| (e, e.freshness(now, app.refresh_interval))),
-        );
-        cards::draw_card_row(frame, &app.theme, cards_area, &fleet_cards(app, &fleet));
+        cards::draw_card_row(frame, &app.theme, cards_area, &fleet_cards);
     }
     draw_body(frame, app, body);
 }
@@ -426,33 +429,60 @@ fn draw_usage_chart(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Table columns, in display order, with their width and drop priority:
+/// as the terminal narrows, the highest numbers go first. MODEL takes any
+/// width left over (up to `MODEL_MAX`), and TREND takes the rest.
+const COLUMNS: [(&str, u16, u8); 14] = [
+    ("NAME", 14, 0),
+    ("ST", 6, 0),
+    ("MODEL", 12, 1),
+    ("RUN", 5, 0),
+    ("WAIT", 5, 1),
+    ("KV", 16, 0),
+    ("PROMPT/s", 9, 2),
+    ("GEN/s", 8, 0),
+    ("REQ/s", 6, 4),
+    // Worst p95 across the endpoint's series — never a merged estimate
+    // (bucket merging across series is not assumed).
+    ("WORST TTFT", 10, 1),
+    ("ABRT", 4, 3),
+    ("RETR", 4, 3),
+    ("AGE", 9, 2),
+    ("GEN tokens/s TREND", 22, 5),
+];
+const MODEL_COL: usize = 2;
+const TREND_COL: usize = 13;
+const MODEL_MAX: u16 = 24;
+
+/// Which columns fit `width`, keeping display order; and MODEL's width.
+fn fit_columns(width: u16) -> (Vec<usize>, u16) {
+    let mut by_priority: Vec<usize> = (0..COLUMNS.len()).collect();
+    by_priority.sort_by_key(|&i| (COLUMNS[i].2, i));
+    let mut chosen = Vec::new();
+    let mut used = 0u16;
+    for i in by_priority {
+        // One cell of spacing between columns.
+        let need = COLUMNS[i].1 + u16::from(!chosen.is_empty());
+        if used + need <= width {
+            used += need;
+            chosen.push(i);
+        }
+    }
+    chosen.sort_unstable();
+    // Leftover width widens MODEL first; TREND (Min(0)) takes what remains.
+    let model_w = (COLUMNS[MODEL_COL].1 + (width - used)).min(MODEL_MAX);
+    (chosen, model_w)
+}
+
 fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let now = Instant::now();
     let ascii = t.mode == crate::ui::theme::ColorMode::Mono;
-    let wide = area.width >= 110;
+    let (cols, model_w) = fit_columns(area.width);
 
     let header = Row::new(
-        [
-            "NAME",
-            "ST",
-            "MODEL",
-            "RUN",
-            "WAIT",
-            "KV",
-            "PROMPT/s",
-            "GEN/s",
-            "REQ/s",
-            // Worst p95 across the endpoint's series — never a merged
-            // estimate (bucket merging across series is not assumed).
-            "WORST TTFT",
-            "ABRT",
-            "RETR",
-            "AGE",
-            if wide { "GEN tokens/s TREND" } else { "" },
-        ]
-        .into_iter()
-        .map(|h| Cell::from(Span::styled(h, t.heading))),
+        cols.iter()
+            .map(|&i| Cell::from(Span::styled(COLUMNS[i].0, t.heading))),
     );
 
     let mut rows: Vec<Row> = Vec::new();
@@ -465,7 +495,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         let model = if agg.models.is_empty() {
             format::NA.to_string()
         } else {
-            format::truncate(&agg.models.join(","), 24)
+            format::truncate(&agg.models.join(","), usize::from(model_w))
         };
 
         let kv_cell = match agg.kv_usage {
@@ -501,14 +531,18 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
             t.value
         };
 
-        // Endpoint-level generation-throughput sparkline: sum across series
-        // is not directly stored, so show the first series' trend.
-        let trend: String = if wide {
-            e.history
-                .iter()
-                .find(|((_, id), _)| *id == crate::state::series_id::GENERATION_TPS)
-                .map(|(_, s)| format::spark(&s.tail_values(20), 20, ascii))
-                .unwrap_or_default()
+        // Endpoint-wide generation trend: every series summed per scrape.
+        let trend: String = if cols.contains(&TREND_COL) {
+            let values: Vec<f64> = crate::ui::tokens::endpoint_total(
+                e,
+                crate::state::series_id::GENERATION_TPS,
+                now,
+                app.config.history_window.as_secs_f64(),
+            )
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+            format::spark(&values, 20, ascii)
         } else {
             String::new()
         };
@@ -523,7 +557,7 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
             t.dim
         };
 
-        let mut row = Row::new(vec![
+        let all = [
             Cell::from(Span::styled(format::truncate(&e.name, 14), t.text)),
             Cell::from(Span::styled(badge, badge_style)),
             Cell::from(Span::styled(model, t.secondary)),
@@ -541,31 +575,62 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
             Cell::from(Span::styled(format::count(agg.retraction_delta), pre_style)),
             Cell::from(Span::styled(age, age_style)),
             Cell::from(Span::styled(trend, t.secondary)),
-        ]);
+        ];
+        let mut row = Row::new(
+            all.into_iter()
+                .enumerate()
+                .filter(|(c, _)| cols.contains(c))
+                .map(|(_, cell)| cell),
+        );
         if row_idx == app.fleet_selected {
             row = row.style(t.selected);
         }
         rows.push(row);
     }
 
-    let widths = [
-        Constraint::Length(14), // NAME
-        Constraint::Length(6),  // ST
-        Constraint::Length(24), // MODEL
-        Constraint::Length(5),  // RUN
-        Constraint::Length(5),  // WAIT
-        Constraint::Length(16), // KV
-        Constraint::Length(9),  // PROMPT/s
-        Constraint::Length(8),  // GEN/s
-        Constraint::Length(6),  // REQ/s
-        Constraint::Length(10), // WORST TTFT
-        Constraint::Length(4),  // ABRT
-        Constraint::Length(4),  // RETR
-        Constraint::Length(9),  // AGE
-        Constraint::Min(0),     // TREND
-    ];
+    let widths: Vec<Constraint> = cols
+        .iter()
+        .map(|&i| match i {
+            MODEL_COL => Constraint::Length(model_w),
+            TREND_COL => Constraint::Min(0),
+            _ => Constraint::Length(COLUMNS[i].1),
+        })
+        .collect();
     let table = Table::new(rows, widths).header(header).column_spacing(1);
     frame.render_widget(table, area);
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    #[test]
+    fn table_columns_always_fit_and_drop_in_priority_order() {
+        for width in 0u16..=260 {
+            let (cols, model_w) = fit_columns(width);
+            let used: u16 = cols
+                .iter()
+                .map(|&i| {
+                    if i == MODEL_COL {
+                        model_w
+                    } else {
+                        COLUMNS[i].1
+                    }
+                })
+                .sum::<u16>()
+                + cols.len().saturating_sub(1) as u16;
+            assert!(used <= width, "{width}: {cols:?} uses {used}");
+            assert!(cols.windows(2).all(|p| p[0] < p[1]), "display order");
+            assert!(model_w <= MODEL_MAX);
+        }
+        // Wide: everything. Portrait (110): MODEL readable, extras dropped.
+        assert_eq!(fit_columns(200).0.len(), COLUMNS.len());
+        let (cols, model_w) = fit_columns(110);
+        let names: Vec<&str> = cols.iter().map(|&i| COLUMNS[i].0).collect();
+        assert!(names.contains(&"MODEL") && model_w >= 12, "{names:?}");
+        assert!(names.contains(&"KV") && names.contains(&"WORST TTFT"));
+        assert!(!names.contains(&"GEN tokens/s TREND"), "{names:?}");
+    }
 }
 
 #[cfg(test)]

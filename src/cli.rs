@@ -18,8 +18,8 @@ use clap::Parser;
 )]
 pub struct Cli {
     /// Endpoint to monitor, as NAME=URL or bare URL. Repeatable.
-    /// An optional @CAP suffix (NAME=URL@8) declares the server's
-    /// --max-running-requests so running shows as an n/max bar.
+    /// An optional @CAP suffix (NAME=URL@8) overrides the server's own
+    /// --max-running-requests for the seat grid.
     /// When given, replaces the endpoint list from the config file entirely.
     #[arg(short, long = "endpoint", value_name = "NAME=URL[@CAP]")]
     pub endpoints: Vec<String>,
